@@ -87,7 +87,7 @@ def merge_comma_separated(existing_value, new_value):
 
 
 def normalize_quantity_text(qty_raw):
-    qty_raw = qty_raw.strip()
+    qty_raw = str(qty_raw).strip()
 
     if "," in qty_raw and "." in qty_raw:
         if qty_raw.rfind(",") > qty_raw.rfind("."):
@@ -182,7 +182,79 @@ def preprocess_for_ocr(img):
 
 
 def line_looks_like_item_row(line):
-    return re.search(r"\b\d{4}\s*-\s*\d{4}\b", line) is not None
+    return re.search(r"\b\d{4}\s*[-–—]\s*\d{4}\b", line) is not None
+
+
+def extract_item_and_remainder(line):
+    """
+    More forgiving item-number extraction:
+    - allows -, en dash, em dash
+    - allows leading text/noise before the part number
+    - does not require exact spacing after item number
+    """
+    item_match = re.search(r"(\d{4}\s*[-–—]\s*\d{4})", line)
+    if not item_match:
+        return None, None
+
+    item_no = re.sub(r"\s*[-–—]\s*", "-", item_match.group(1).strip())
+    remainder = line[item_match.end():].strip()
+    return item_no, remainder
+
+
+def parse_quantity_and_description(remainder):
+    """
+    Try a few increasingly forgiving patterns to recover description + quantity.
+    """
+
+    # 1) Known units first
+    qty_match = re.search(
+        r"(.+?)\s+([\d.,]+)\s+(piece|stück|pcs?|bundle|kg|pc|roll|rolle|set|sets|meter|metre|each|einh\.?|stk|stck|m)\b",
+        remainder,
+        re.IGNORECASE,
+    )
+    if qty_match:
+        description = qty_match.group(1).strip()
+        qty_raw = qty_match.group(2).strip()
+        unit = qty_match.group(3).strip().lower()
+        try:
+            quantity = normalize_quantity_text(qty_raw)
+            return description, quantity, unit
+        except Exception:
+            pass
+
+    # 2) Any number near end of line, optional trailing unit/noise token
+    fallback_match = re.search(
+        r"(.+?)\s+([\d.,]+)(?:\s+\S+)?$",
+        remainder,
+        re.IGNORECASE,
+    )
+    if fallback_match:
+        description = fallback_match.group(1).strip()
+        qty_raw = fallback_match.group(2).strip()
+        unit = "auto"
+        try:
+            quantity = normalize_quantity_text(qty_raw)
+            return description, quantity, unit
+        except Exception:
+            pass
+
+    # 3) Slightly stricter fallback with alphabetic end token
+    fallback_match_2 = re.search(
+        r"(.+?)\s+([\d.,]+)(?:\s+[A-Za-zÄÖÜäöü\.]+)?$",
+        remainder,
+        re.IGNORECASE,
+    )
+    if fallback_match_2:
+        description = fallback_match_2.group(1).strip()
+        qty_raw = fallback_match_2.group(2).strip()
+        unit = "fallback"
+        try:
+            quantity = normalize_quantity_text(qty_raw)
+            return description, quantity, unit
+        except Exception:
+            pass
+
+    return None, None, None
 
 
 def load_pages_from_upload(uploaded_file):
@@ -208,6 +280,7 @@ def process_delivery_files(delivery_files):
     all_items = []
     preview_images = []
     ocr_text_records = []
+    skipped_line_records = []
 
     progress = st.progress(0, text="Starting OCR processing...")
     total_files = len(delivery_files)
@@ -247,7 +320,8 @@ def process_delivery_files(delivery_files):
             page_item_count = 0
 
             for line in lines:
-                line = " ".join(line.split())
+                original_line = line
+                line = " ".join(str(line).split())
 
                 if not line:
                     continue
@@ -279,51 +353,34 @@ def process_delivery_files(delivery_files):
                 if not line:
                     continue
 
-                item_match = re.search(r"^\s*(\d{4}\s*-\s*\d{4})\s+(.+)$", line)
-                if not item_match:
+                item_no, remainder = extract_item_and_remainder(line)
+                if not item_no:
+                    if re.search(r"\d{4}", line):
+                        skipped_line_records.append(
+                            {
+                                "SourceFile": uploaded_file.name,
+                                "PageNumber": page_index,
+                                "Reason": "No item match",
+                                "Line": original_line,
+                                "CleanedLine": line,
+                            }
+                        )
                     continue
 
-                item_no = re.sub(r"\s*-\s*", "-", item_match.group(1).strip())
-                remainder = item_match.group(2).strip()
-
-                description = None
-                quantity = None
-                unit = None
-
-                qty_match = re.search(
-                    r"(.+?)\s+([\d.,]+)\s+(piece|stück|pcs?|bundle|kg|pc|roll|rolle|set|sets|meter|metre|each|einh\.?)\b",
-                    remainder,
-                    re.IGNORECASE,
-                )
-
-                if qty_match:
-                    description = qty_match.group(1).strip()
-                    qty_raw = qty_match.group(2).strip()
-                    unit = qty_match.group(3).strip().lower()
-
-                    try:
-                        quantity = normalize_quantity_text(qty_raw)
-                    except Exception:
-                        quantity = None
-
-                if quantity is None:
-                    fallback_match = re.search(
-                        r"(.+?)\s+([\d.,]+)(?:\s+[A-Za-zÄÖÜäöü\.]+)?$",
-                        remainder,
-                        re.IGNORECASE,
-                    )
-
-                    if fallback_match:
-                        description = fallback_match.group(1).strip()
-                        qty_raw = fallback_match.group(2).strip()
-                        unit = "fallback"
-
-                        try:
-                            quantity = normalize_quantity_text(qty_raw)
-                        except Exception:
-                            quantity = None
+                description, quantity, unit = parse_quantity_and_description(remainder)
 
                 if quantity is None or description is None:
+                    skipped_line_records.append(
+                        {
+                            "SourceFile": uploaded_file.name,
+                            "PageNumber": page_index,
+                            "Reason": "No quantity/description parse",
+                            "Line": original_line,
+                            "CleanedLine": line,
+                            "ItemNoGuess": item_no,
+                            "Remainder": remainder,
+                        }
+                    )
                     continue
 
                 all_items.append(
@@ -347,6 +404,7 @@ def process_delivery_files(delivery_files):
 
     raw_df = pd.DataFrame(all_items)
     ocr_text_df = pd.DataFrame(ocr_text_records)
+    skipped_lines_df = pd.DataFrame(skipped_line_records)
 
     if raw_df.empty:
         summary_df = pd.DataFrame(columns=["ItemNo", "Description", "Quantity", "PalletList", "DocumentList"])
@@ -364,7 +422,7 @@ def process_delivery_files(delivery_files):
 
         summary_df = summary_df[["ItemNo", "Description", "Quantity", "PalletList", "DocumentList"]]
 
-    return raw_df, summary_df, preview_images, ocr_text_df
+    return raw_df, summary_df, preview_images, ocr_text_df, skipped_lines_df
 
 
 def build_tracker_lookup(wb):
@@ -582,7 +640,7 @@ if process_clicked:
     st.session_state.results = {}
 
     with st.spinner("Running OCR and updating tracker..."):
-        raw_df, summary_df, preview_images, ocr_text_df = process_delivery_files(delivery_files)
+        raw_df, summary_df, preview_images, ocr_text_df, skipped_lines_df = process_delivery_files(delivery_files)
 
         tracker_bytes = tracker_file.getvalue()
         wb = load_workbook(BytesIO(tracker_bytes))
@@ -608,6 +666,12 @@ if process_clicked:
             }
         )
 
+        skipped_lines_export_bytes = dataframe_to_excel_bytes(
+            {
+                "Skipped_Lines": skipped_lines_df if not skipped_lines_df.empty else pd.DataFrame()
+            }
+        )
+
         updated_tracker_bytes = workbook_to_bytes(wb)
 
         unmatched_export_bytes = None
@@ -626,6 +690,8 @@ if process_clicked:
         "parsed_rows_export_bytes": parsed_rows_export_bytes,
         "ocr_text_export_bytes": ocr_text_export_bytes,
         "ocr_text_df": ocr_text_df,
+        "skipped_lines_df": skipped_lines_df,
+        "skipped_lines_export_bytes": skipped_lines_export_bytes,
         "unmatched_export_bytes": unmatched_export_bytes,
     }
 
@@ -647,6 +713,8 @@ if st.session_state.processed:
     parsed_rows_export_bytes = results["parsed_rows_export_bytes"]
     ocr_text_export_bytes = results["ocr_text_export_bytes"]
     ocr_text_df = results["ocr_text_df"]
+    skipped_lines_df = results["skipped_lines_df"]
+    skipped_lines_export_bytes = results["skipped_lines_export_bytes"]
     unmatched_export_bytes = results["unmatched_export_bytes"]
 
     st.success("Processing complete.")
@@ -672,6 +740,12 @@ if st.session_state.processed:
 
     with st.expander("OCR Raw Text Preview", expanded=False):
         st.dataframe(ocr_text_df, use_container_width=True)
+
+    with st.expander("Skipped Lines Preview", expanded=False):
+        if not skipped_lines_df.empty:
+            st.dataframe(skipped_lines_df, use_container_width=True)
+        else:
+            st.info("No skipped lines were recorded.")
 
     st.subheader("Unmatched Items")
     if unmatched_df is not None and not unmatched_df.empty:
@@ -708,6 +782,13 @@ if st.session_state.processed:
         label="Download OCR Raw Text",
         data=ocr_text_export_bytes,
         file_name="OCR_Raw_Text.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.download_button(
+        label="Download Skipped Lines",
+        data=skipped_lines_export_bytes,
+        file_name="Skipped_Lines.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
