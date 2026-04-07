@@ -2,7 +2,6 @@ import os
 import re
 import tempfile
 from io import BytesIO
-from difflib import get_close_matches
 
 import pandas as pd
 import pytesseract
@@ -30,7 +29,7 @@ if "run_id" not in st.session_state:
 
 
 # -----------------------------
-# Normalization Helpers
+# Helpers
 # -----------------------------
 def normalize_text(value):
     if value is None:
@@ -56,31 +55,8 @@ def normalize_part_number(value):
     if value.startswith("'"):
         value = value[1:]
     value = value.replace("\xa0", " ")
-    value = value.replace("—", "-").replace("–", "-")
     value = " ".join(value.split())
     return value.upper()
-
-
-def normalize_ocr_part_text(value):
-    if value is None:
-        return ""
-
-    value = str(value).strip()
-    value = value.replace("—", "-").replace("–", "-")
-    value = value.upper()
-
-    # Common OCR substitutions
-    value = value.replace("O", "0")
-    value = value.replace("I", "1")
-    value = value.replace("L", "1")
-
-    value = re.sub(r"\s*-\s*", "-", value)
-    value = re.sub(r"\s+", "", value)
-
-    if re.fullmatch(r"\d{8}", value):
-        value = value[:4] + "-" + value[4:]
-
-    return value
 
 
 def combine_unique_values(series):
@@ -111,7 +87,7 @@ def merge_comma_separated(existing_value, new_value):
 
 
 def normalize_quantity_text(qty_raw):
-    qty_raw = str(qty_raw).strip().replace(" ", "")
+    qty_raw = str(qty_raw).strip()
 
     if "," in qty_raw and "." in qty_raw:
         if qty_raw.rfind(",") > qty_raw.rfind("."):
@@ -136,9 +112,6 @@ def normalize_quantity_text(qty_raw):
     return int(float(qty_clean))
 
 
-# -----------------------------
-# OCR / Parsing Helpers
-# -----------------------------
 def extract_document_number(text):
     patterns = [
         r"Truck\s*No\.?\s*[:#]?\s*([A-Z0-9\-\/]+)",
@@ -156,8 +129,17 @@ def extract_document_number(text):
 def is_table_header(line):
     line_lower = line.lower()
 
-    item_words = ["item", "artikelnr", "artikelnr."]
-    desc_words = ["descr", "beschr", "beschr."]
+    item_words = [
+        "item",
+        "artikelnr",
+        "artikelnr.",
+    ]
+
+    desc_words = [
+        "descr",
+        "beschr",
+        "beschr.",
+    ]
 
     has_item = any(word in line_lower for word in item_words)
     has_desc = any(word in line_lower for word in desc_words)
@@ -167,7 +149,13 @@ def is_table_header(line):
 
 def is_end_of_table(line):
     line_lower = line.lower().strip()
-    end_words = ["total colli", "anzahl colli", "anzahl colli:"]
+
+    end_words = [
+        "total colli",
+        "anzahl colli",
+        "anzahl colli:",
+    ]
+
     return any(word in line_lower for word in end_words)
 
 
@@ -186,68 +174,46 @@ def extract_colli_number(line):
 
 
 def preprocess_for_ocr(img):
-    img = ImageOps.exif_transpose(img)
     img = img.convert("L")
     img = ImageOps.autocontrast(img)
-
-    w, h = img.size
-    img = img.resize((w * 2, h * 2))
-
-    img = img.filter(ImageFilter.MedianFilter(size=3))
     img = img.filter(ImageFilter.SHARPEN)
-
+    img = img.point(lambda p: 255 if p > 170 else 0)
     return img
 
 
-def run_ocr(img):
-    processed_img = preprocess_for_ocr(img)
-    text = pytesseract.image_to_string(
-        processed_img,
-        config="--oem 3 --psm 6 -c preserve_interword_spaces=1"
-    )
-    return processed_img, text
-
-
 def line_looks_like_item_row(line):
-    line = line.replace("—", "-").replace("–", "-")
-    patterns = [
-        r"\b\d{4}\s*-\s*\d{4}\b",
-        r"\b\d{4}\s+\d{4}\b",
-        r"\b\d{8}\b",
-    ]
-    return any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns)
+    return re.search(r"\b\d{4}\s*[-–—]\s*\d{4}\b", line) is not None
 
 
 def extract_item_and_remainder(line):
-    cleaned = line.replace("—", "-").replace("–", "-")
+    """
+    More forgiving item-number extraction:
+    - allows -, en dash, em dash
+    - allows leading text/noise before the part number
+    - does not require exact spacing after item number
+    """
+    item_match = re.search(r"(\d{4}\s*[-–—]\s*\d{4})", line)
+    if not item_match:
+        return None, None
 
-    patterns = [
-        r"(\d{4}\s*-\s*\d{4})",
-        r"(\d{4}\s+\d{4})",
-        r"(\d{8})",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, cleaned, re.IGNORECASE)
-        if m:
-            raw_item = m.group(1)
-            item_no = normalize_ocr_part_text(raw_item)
-            remainder = cleaned[m.end():].strip()
-            return item_no, remainder
-
-    return None, None
+    item_no = re.sub(r"\s*[-–—]\s*", "-", item_match.group(1).strip())
+    remainder = line[item_match.end():].strip()
+    return item_no, remainder
 
 
 def parse_quantity_and_description(remainder):
-    remainder = " ".join(str(remainder).split())
+    """
+    Try a few increasingly forgiving patterns to recover description + quantity.
+    """
 
+    # 1) Known units first
     qty_match = re.search(
         r"(.+?)\s+([\d.,]+)\s+(piece|stück|pcs?|bundle|kg|pc|roll|rolle|set|sets|meter|metre|each|einh\.?|stk|stck|m)\b",
         remainder,
         re.IGNORECASE,
     )
     if qty_match:
-        description = qty_match.group(1).strip(" -.;:")
+        description = qty_match.group(1).strip()
         qty_raw = qty_match.group(2).strip()
         unit = qty_match.group(3).strip().lower()
         try:
@@ -256,38 +222,41 @@ def parse_quantity_and_description(remainder):
         except Exception:
             pass
 
+    # 2) Any number near end of line, optional trailing unit/noise token
     fallback_match = re.search(
         r"(.+?)\s+([\d.,]+)(?:\s+\S+)?$",
         remainder,
         re.IGNORECASE,
     )
     if fallback_match:
-        description = fallback_match.group(1).strip(" -.;:")
+        description = fallback_match.group(1).strip()
         qty_raw = fallback_match.group(2).strip()
+        unit = "auto"
         try:
             quantity = normalize_quantity_text(qty_raw)
-            return description, quantity, "auto"
+            return description, quantity, unit
         except Exception:
             pass
 
-    candidates = re.findall(r"[\d.,]+", remainder)
-    if candidates:
-        for qty_raw in reversed(candidates):
-            try:
-                quantity = normalize_quantity_text(qty_raw)
-                qty_pos = remainder.rfind(qty_raw)
-                description = remainder[:qty_pos].strip(" -.;:")
-                if description:
-                    return description, quantity, "fallback"
-            except Exception:
-                continue
+    # 3) Slightly stricter fallback with alphabetic end token
+    fallback_match_2 = re.search(
+        r"(.+?)\s+([\d.,]+)(?:\s+[A-Za-zÄÖÜäöü\.]+)?$",
+        remainder,
+        re.IGNORECASE,
+    )
+    if fallback_match_2:
+        description = fallback_match_2.group(1).strip()
+        qty_raw = fallback_match_2.group(2).strip()
+        unit = "fallback"
+        try:
+            quantity = normalize_quantity_text(qty_raw)
+            return description, quantity, unit
+        except Exception:
+            pass
 
     return None, None, None
 
 
-# -----------------------------
-# File Loading
-# -----------------------------
 def load_pages_from_upload(uploaded_file):
     ext = os.path.splitext(uploaded_file.name)[1].lower()
 
@@ -297,91 +266,17 @@ def load_pages_from_upload(uploaded_file):
             tmp_path = tmp.name
 
         try:
-            pages = convert_from_path(tmp_path, dpi=250)
-            return [page.convert("RGB") for page in pages]
+            pages = convert_from_path(tmp_path, dpi=300)
+            return [page.convert("L") for page in pages]
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
     else:
-        img = Image.open(uploaded_file).convert("RGB")
+        img = Image.open(uploaded_file).convert("L")
         return [img]
 
 
-# -----------------------------
-# Tracker Lookup
-# -----------------------------
-def build_tracker_lookup(wb):
-    tracker_rows = {}
-    known_tracker_parts = set()
-
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        headers = {}
-
-        for col in range(1, ws.max_column + 1):
-            value = ws.cell(row=1, column=col).value
-            if value is not None:
-                headers[normalize_header(value)] = col
-
-        item_col = headers.get("item #") or headers.get("part #")
-        qty_col = headers.get("qty received")
-        pallet_col = headers.get("pallet #")
-        container_col = headers.get("container")
-
-        if not item_col or not qty_col:
-            continue
-
-        for row in range(2, ws.max_row + 1):
-            item_value = ws.cell(row=row, column=item_col).value
-            if item_value is None:
-                continue
-
-            normalized_item = normalize_text(item_value)
-
-            if normalized_item:
-                known_tracker_parts.add(normalized_item)
-
-                if normalized_item not in tracker_rows:
-                    tracker_rows[normalized_item] = []
-
-                tracker_rows[normalized_item].append(
-                    {
-                        "sheet": ws,
-                        "row": row,
-                        "qty_col": qty_col,
-                        "pallet_col": pallet_col,
-                        "container_col": container_col,
-                    }
-                )
-
-    return tracker_rows, sorted(known_tracker_parts)
-
-
-def recover_part_from_tracker(item_no, known_tracker_parts):
-    if not item_no:
-        return item_no
-
-    item_no = normalize_ocr_part_text(item_no)
-
-    if item_no in known_tracker_parts:
-        return item_no
-
-    compact = item_no.replace("-", "")
-    for known in known_tracker_parts:
-        if known.replace("-", "") == compact:
-            return known
-
-    matches = get_close_matches(item_no, known_tracker_parts, n=1, cutoff=0.90)
-    if matches:
-        return matches[0]
-
-    return item_no
-
-
-# -----------------------------
-# OCR Processing
-# -----------------------------
-def process_delivery_files(delivery_files, known_tracker_parts):
+def process_delivery_files(delivery_files):
     all_items = []
     preview_images = []
     ocr_text_records = []
@@ -397,11 +292,17 @@ def process_delivery_files(delivery_files, known_tracker_parts):
         )
 
         pages = load_pages_from_upload(uploaded_file)
+
         table_started_in_previous_page = False
 
         for page_index, page_img in enumerate(pages, start=1):
-            processed_img, text = run_ocr(page_img)
+            processed_img = preprocess_for_ocr(page_img)
             preview_images.append((f"{uploaded_file.name} - Page {page_index}", processed_img))
+
+            text = pytesseract.image_to_string(
+                processed_img,
+                config="--psm 6 -c preserve_interword_spaces=1"
+            )
 
             ocr_text_records.append(
                 {
@@ -412,12 +313,13 @@ def process_delivery_files(delivery_files, known_tracker_parts):
             )
 
             document_number = extract_document_number(text)
+
             lines = text.split("\n")
             capture = table_started_in_previous_page
             current_colli = ""
             page_item_count = 0
 
-            for line_no, line in enumerate(lines, start=1):
+            for line in lines:
                 original_line = line
                 line = " ".join(str(line).split())
 
@@ -458,7 +360,6 @@ def process_delivery_files(delivery_files, known_tracker_parts):
                             {
                                 "SourceFile": uploaded_file.name,
                                 "PageNumber": page_index,
-                                "LineNumber": line_no,
                                 "Reason": "No item match",
                                 "Line": original_line,
                                 "CleanedLine": line,
@@ -466,15 +367,13 @@ def process_delivery_files(delivery_files, known_tracker_parts):
                         )
                     continue
 
-                item_no = recover_part_from_tracker(item_no, known_tracker_parts)
-
                 description, quantity, unit = parse_quantity_and_description(remainder)
+
                 if quantity is None or description is None:
                     skipped_line_records.append(
                         {
                             "SourceFile": uploaded_file.name,
                             "PageNumber": page_index,
-                            "LineNumber": line_no,
                             "Reason": "No quantity/description parse",
                             "Line": original_line,
                             "CleanedLine": line,
@@ -526,26 +425,75 @@ def process_delivery_files(delivery_files, known_tracker_parts):
     return raw_df, summary_df, preview_images, ocr_text_df, skipped_lines_df
 
 
-# -----------------------------
-# Workbook Update
-# -----------------------------
+def build_tracker_lookup(wb):
+    tracker_rows = {}
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        headers = {}
+
+        for col in range(1, ws.max_column + 1):
+            value = ws.cell(row=1, column=col).value
+            if value is not None:
+                headers[normalize_header(value)] = col
+
+        item_col = headers.get("item #") or headers.get("part #")
+        qty_col = headers.get("qty received")
+        pallet_col = headers.get("pallet #")
+        container_col = headers.get("container")
+
+        if not item_col or not qty_col:
+            continue
+
+        for row in range(2, ws.max_row + 1):
+            item_value = ws.cell(row=row, column=item_col).value
+            if item_value is None:
+                continue
+
+            normalized_item = normalize_text(item_value)
+
+            if normalized_item:
+                if normalized_item not in tracker_rows:
+                    tracker_rows[normalized_item] = []
+
+                tracker_rows[normalized_item].append(
+                    {
+                        "sheet": ws,
+                        "row": row,
+                        "headers": headers,
+                        "item_col": item_col,
+                        "qty_col": qty_col,
+                        "pallet_col": pallet_col,
+                        "container_col": container_col,
+                        "original_item": item_value,
+                    }
+                )
+
+    return tracker_rows
+
+
 def update_tracker_workbook(wb, summary_df, raw_df):
-    tracker_rows, known_tracker_parts = build_tracker_lookup(wb)
+    tracker_rows = build_tracker_lookup(wb)
 
     matched = []
     not_found = []
 
     for _, row in summary_df.iterrows():
-        item_no = recover_part_from_tracker(normalize_part_number(row["ItemNo"]), known_tracker_parts)
+        raw_item_no = row["ItemNo"]
+        item_no = normalize_part_number(raw_item_no)
+
         qty = row["Quantity"]
         desc = row["Description"]
         pallet_list = row["PalletList"]
         document_list = row["DocumentList"]
 
         if item_no in tracker_rows:
-            for entry in tracker_rows[item_no]:
+            entries = tracker_rows[item_no]
+
+            for entry in entries:
                 ws = entry["sheet"]
                 excel_row = entry["row"]
+
                 qty_col = entry["qty_col"]
                 pallet_col = entry["pallet_col"]
                 container_col = entry["container_col"]
@@ -554,11 +502,13 @@ def update_tracker_workbook(wb, summary_df, raw_df):
 
                 if pallet_col is not None:
                     existing_pallets = ws.cell(row=excel_row, column=pallet_col).value
-                    ws.cell(row=excel_row, column=pallet_col).value = merge_comma_separated(existing_pallets, pallet_list)
+                    merged_pallets = merge_comma_separated(existing_pallets, pallet_list)
+                    ws.cell(row=excel_row, column=pallet_col).value = merged_pallets
 
                 if container_col is not None:
                     existing_containers = ws.cell(row=excel_row, column=container_col).value
-                    ws.cell(row=excel_row, column=container_col).value = merge_comma_separated(existing_containers, document_list)
+                    merged_containers = merge_comma_separated(existing_containers, document_list)
+                    ws.cell(row=excel_row, column=container_col).value = merged_containers
 
                 matched.append(
                     {
@@ -584,20 +534,32 @@ def update_tracker_workbook(wb, summary_df, raw_df):
 
     unmatched_rows = []
 
+    item_column = "Item #" if "Item #" in raw_df.columns else "ItemNo" if "ItemNo" in raw_df.columns else None
+    if item_column is None:
+        raise ValueError(f"Could not find item column in raw_df. Columns found: {list(raw_df.columns)}")
+
     for _, row in raw_df.iterrows():
-        item_no = recover_part_from_tracker(normalize_part_number(row["ItemNo"]), known_tracker_parts)
+        raw_item_no = row[item_column]
+        item_no = normalize_part_number(raw_item_no)
+
+        desc = row["Description"] if "Description" in raw_df.columns else ""
+        qty = row["Quantity"] if "Quantity" in raw_df.columns else ""
+        source_file = row["SourceFile"] if "SourceFile" in raw_df.columns else ""
+        page_number = row["PageNumber"] if "PageNumber" in raw_df.columns else ""
+        colli_no = row["ColliNo"] if "ColliNo" in raw_df.columns else ""
+        document_number = row["DocumentNumber"] if "DocumentNumber" in raw_df.columns else ""
 
         if item_no not in tracker_rows:
             unmatched_rows.append(
                 {
-                    "Item #": row["ItemNo"],
+                    "Item #": raw_item_no,
                     "Normalized Item #": item_no,
-                    "Description": row.get("Description", ""),
-                    "Quantity": row.get("Quantity", ""),
-                    "ColliNo": row.get("ColliNo", ""),
-                    "DocumentNumber": row.get("DocumentNumber", ""),
-                    "SourceFile": row.get("SourceFile", ""),
-                    "PageNumber": row.get("PageNumber", ""),
+                    "Description": desc,
+                    "Quantity": qty,
+                    "ColliNo": colli_no,
+                    "DocumentNumber": document_number,
+                    "SourceFile": source_file,
+                    "PageNumber": page_number,
                 }
             )
 
@@ -617,9 +579,6 @@ def update_tracker_workbook(wb, summary_df, raw_df):
     return wb, matched_df, not_found_df, unmatched_df
 
 
-# -----------------------------
-# Export Helpers
-# -----------------------------
 def workbook_to_bytes(wb):
     output = BytesIO()
     wb.save(output)
@@ -631,7 +590,7 @@ def dataframe_to_excel_bytes(sheets_dict):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, df in sheets_dict.items():
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
     output.seek(0)
     return output.getvalue()
 
@@ -660,11 +619,13 @@ with col_a:
 with col_b:
     reset_clicked = st.button("Reset / Run New Files")
 
+
 if reset_clicked:
     st.session_state.processed = False
     st.session_state.results = {}
     st.session_state.run_id += 1
     st.rerun()
+
 
 if process_clicked:
     if not delivery_files:
@@ -679,15 +640,10 @@ if process_clicked:
     st.session_state.results = {}
 
     with st.spinner("Running OCR and updating tracker..."):
+        raw_df, summary_df, preview_images, ocr_text_df, skipped_lines_df = process_delivery_files(delivery_files)
+
         tracker_bytes = tracker_file.getvalue()
         wb = load_workbook(BytesIO(tracker_bytes))
-
-        _, known_tracker_parts = build_tracker_lookup(wb)
-
-        raw_df, summary_df, preview_images, ocr_text_df, skipped_lines_df = process_delivery_files(
-            delivery_files,
-            known_tracker_parts
-        )
 
         wb, matched_df, not_found_df, unmatched_df = update_tracker_workbook(wb, summary_df, raw_df)
 
@@ -699,15 +655,21 @@ if process_clicked:
         )
 
         parsed_rows_export_bytes = dataframe_to_excel_bytes(
-            {"Parsed_OCR_Rows": raw_df if not raw_df.empty else pd.DataFrame()}
+            {
+                "Parsed_OCR_Rows": raw_df if not raw_df.empty else pd.DataFrame()
+            }
         )
 
         ocr_text_export_bytes = dataframe_to_excel_bytes(
-            {"OCR_Raw_Text": ocr_text_df if not ocr_text_df.empty else pd.DataFrame()}
+            {
+                "OCR_Raw_Text": ocr_text_df if not ocr_text_df.empty else pd.DataFrame()
+            }
         )
 
         skipped_lines_export_bytes = dataframe_to_excel_bytes(
-            {"Skipped_Lines": skipped_lines_df if not skipped_lines_df.empty else pd.DataFrame()}
+            {
+                "Skipped_Lines": skipped_lines_df if not skipped_lines_df.empty else pd.DataFrame()
+            }
         )
 
         updated_tracker_bytes = workbook_to_bytes(wb)
@@ -735,6 +697,7 @@ if process_clicked:
 
     st.session_state.processed = True
     st.rerun()
+
 
 if st.session_state.processed:
     results = st.session_state.results
